@@ -82,16 +82,6 @@ func setStorageSystemMetadata(s *StorageMeta, sm StorageSystemMetadata) {
 	s.SetSystemMetadata(sm)
 }
 
-// WithDefaultIoCallback will apply default_io_callback value to Options.
-//
-// IoCallback specify what todo every time we read data from source
-func WithDefaultIoCallback(v func([]byte)) Pair {
-	return Pair{
-		Key:   "default_io_callback",
-		Value: v,
-	}
-}
-
 // WithDefaultServicePairs will apply default_service_pairs value to Options.
 //
 // DefaultServicePairs set default pairs for service actions
@@ -298,6 +288,7 @@ var pairMap = map[string]string{
 	"context":                               "context.Context",
 	"continuation_token":                    "string",
 	"credential":                            "string",
+	"default_content_type":                  "string",
 	"default_io_callback":                   "func([]byte)",
 	"default_service_pairs":                 "DefaultServicePairs",
 	"default_storage_class":                 "string",
@@ -688,10 +679,11 @@ func (s *Service) ListWithContext(ctx context.Context, pairs ...Pair) (sti *Stor
 }
 
 var (
-	_ Direr       = &Storage{}
-	_ Linker      = &Storage{}
-	_ Multiparter = &Storage{}
-	_ Storager    = &Storage{}
+	_ Direr             = &Storage{}
+	_ Linker            = &Storage{}
+	_ Multiparter       = &Storage{}
+	_ StorageHTTPSigner = &Storage{}
+	_ Storager          = &Storage{}
 )
 
 type StorageFeatures struct {
@@ -733,6 +725,8 @@ type pairStorageNew struct {
 	hasEnableVirtualLink bool
 	EnableVirtualLink    bool
 	// Default pairs
+	hasDefaultContentType  bool
+	DefaultContentType     string
 	hasDefaultIoCallback   bool
 	DefaultIoCallback      func([]byte)
 	hasDefaultStorageClass bool
@@ -793,6 +787,12 @@ func parsePairStorageNew(opts []Pair) (pairStorageNew, error) {
 			result.hasEnableVirtualLink = true
 			result.EnableVirtualLink = true
 		// Default pairs
+		case "default_content_type":
+			if result.hasDefaultContentType {
+				continue
+			}
+			result.hasDefaultContentType = true
+			result.DefaultContentType = v.Value.(string)
 		case "default_io_callback":
 			if result.hasDefaultIoCallback {
 				continue
@@ -819,6 +819,10 @@ func parsePairStorageNew(opts []Pair) (pairStorageNew, error) {
 	}
 
 	// Default pairs
+	if result.hasDefaultContentType {
+		result.HasDefaultStoragePairs = true
+		result.DefaultStoragePairs.Write = append(result.DefaultStoragePairs.Write, WithContentType(result.DefaultContentType))
+	}
 	if result.hasDefaultIoCallback {
 		result.HasDefaultStoragePairs = true
 		result.DefaultStoragePairs.Read = append(result.DefaultStoragePairs.Read, WithIoCallback(result.DefaultIoCallback))
@@ -843,19 +847,21 @@ func parsePairStorageNew(opts []Pair) (pairStorageNew, error) {
 
 // DefaultStoragePairs is default pairs for specific action
 type DefaultStoragePairs struct {
-	CompleteMultipart []Pair
-	Create            []Pair
-	CreateDir         []Pair
-	CreateLink        []Pair
-	CreateMultipart   []Pair
-	Delete            []Pair
-	List              []Pair
-	ListMultipart     []Pair
-	Metadata          []Pair
-	Read              []Pair
-	Stat              []Pair
-	Write             []Pair
-	WriteMultipart    []Pair
+	CompleteMultipart  []Pair
+	Create             []Pair
+	CreateDir          []Pair
+	CreateLink         []Pair
+	CreateMultipart    []Pair
+	Delete             []Pair
+	List               []Pair
+	ListMultipart      []Pair
+	Metadata           []Pair
+	QuerySignHTTPRead  []Pair
+	QuerySignHTTPWrite []Pair
+	Read               []Pair
+	Stat               []Pair
+	Write              []Pair
+	WriteMultipart     []Pair
 }
 
 // pairStorageCompleteMultipart is the parsed struct
@@ -1219,6 +1225,52 @@ func (s *Storage) parsePairStorageMetadata(opts []Pair) (pairStorageMetadata, er
 		switch v.Key {
 		default:
 			return pairStorageMetadata{}, services.PairUnsupportedError{Pair: v}
+		}
+	}
+
+	// Check required pairs.
+
+	return result, nil
+}
+
+// pairStorageQuerySignHTTPRead is the parsed struct
+type pairStorageQuerySignHTTPRead struct {
+	pairs []Pair
+}
+
+// parsePairStorageQuerySignHTTPRead will parse Pair slice into *pairStorageQuerySignHTTPRead
+func (s *Storage) parsePairStorageQuerySignHTTPRead(opts []Pair) (pairStorageQuerySignHTTPRead, error) {
+	result := pairStorageQuerySignHTTPRead{
+		pairs: opts,
+	}
+
+	for _, v := range opts {
+		switch v.Key {
+		default:
+			return pairStorageQuerySignHTTPRead{}, services.PairUnsupportedError{Pair: v}
+		}
+	}
+
+	// Check required pairs.
+
+	return result, nil
+}
+
+// pairStorageQuerySignHTTPWrite is the parsed struct
+type pairStorageQuerySignHTTPWrite struct {
+	pairs []Pair
+}
+
+// parsePairStorageQuerySignHTTPWrite will parse Pair slice into *pairStorageQuerySignHTTPWrite
+func (s *Storage) parsePairStorageQuerySignHTTPWrite(opts []Pair) (pairStorageQuerySignHTTPWrite, error) {
+	result := pairStorageQuerySignHTTPWrite{
+		pairs: opts,
+	}
+
+	for _, v := range opts {
+		switch v.Key {
+		default:
+			return pairStorageQuerySignHTTPWrite{}, services.PairUnsupportedError{Pair: v}
 		}
 	}
 
@@ -1827,6 +1879,56 @@ func (s *Storage) Metadata(pairs ...Pair) (meta *StorageMeta) {
 	opt, _ = s.parsePairStorageMetadata(pairs)
 
 	return s.metadata(opt)
+}
+
+// QuerySignHTTPRead will read data from the file by using query parameters to authenticate requests.
+//
+// This function will create a context by default.
+func (s *Storage) QuerySignHTTPRead(path string, expire time.Duration, pairs ...Pair) (req *http.Request, err error) {
+	ctx := context.Background()
+	return s.QuerySignHTTPReadWithContext(ctx, path, expire, pairs...)
+}
+
+// QuerySignHTTPReadWithContext will read data from the file by using query parameters to authenticate requests.
+func (s *Storage) QuerySignHTTPReadWithContext(ctx context.Context, path string, expire time.Duration, pairs ...Pair) (req *http.Request, err error) {
+	defer func() {
+		err = s.formatError("query_sign_http_read", err, path)
+	}()
+
+	pairs = append(pairs, s.defaultPairs.QuerySignHTTPRead...)
+	var opt pairStorageQuerySignHTTPRead
+
+	opt, err = s.parsePairStorageQuerySignHTTPRead(pairs)
+	if err != nil {
+		return
+	}
+
+	return s.querySignHTTPRead(ctx, path, expire, opt)
+}
+
+// QuerySignHTTPWrite will write data into a file by using query parameters to authenticate requests.
+//
+// This function will create a context by default.
+func (s *Storage) QuerySignHTTPWrite(path string, size int64, expire time.Duration, pairs ...Pair) (req *http.Request, err error) {
+	ctx := context.Background()
+	return s.QuerySignHTTPWriteWithContext(ctx, path, size, expire, pairs...)
+}
+
+// QuerySignHTTPWriteWithContext will write data into a file by using query parameters to authenticate requests.
+func (s *Storage) QuerySignHTTPWriteWithContext(ctx context.Context, path string, size int64, expire time.Duration, pairs ...Pair) (req *http.Request, err error) {
+	defer func() {
+		err = s.formatError("query_sign_http_write", err, path)
+	}()
+
+	pairs = append(pairs, s.defaultPairs.QuerySignHTTPWrite...)
+	var opt pairStorageQuerySignHTTPWrite
+
+	opt, err = s.parsePairStorageQuerySignHTTPWrite(pairs)
+	if err != nil {
+		return
+	}
+
+	return s.querySignHTTPWrite(ctx, path, size, expire, opt)
 }
 
 // Read will read the file's data.
